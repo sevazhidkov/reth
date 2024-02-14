@@ -2,7 +2,7 @@ use crate::Tables;
 use metrics::{Gauge, Histogram};
 use reth_libmdbx::CommitLatency;
 use reth_metrics::{metrics::Counter, Metrics};
-use rustc_hash::FxHasher;
+use rustc_hash::{FxHashMap, FxHasher};
 use std::{
     collections::HashMap,
     hash::BuildHasherDefault,
@@ -17,14 +17,30 @@ const LARGE_VALUE_THRESHOLD_BYTES: usize = 4096;
 #[derive(Debug)]
 pub struct DatabaseEnvMetrics {
     /// Caches OperationMetrics handles for each table and operation tuple.
-    operations: HashMap<(Tables, Operation), OperationMetrics, BuildHasherDefault<FxHasher>>,
+    operations: FxHashMap<(Tables, Operation), OperationMetrics>,
+    /// Caches TransactionMetrics handles for counters grouped by only transaction mode.
+    /// Updated both at tx open and close.
+    open_transactions: FxHashMap<TransactionMode, TransactionMetrics>,
+    /// Caches TransactionMetrics handles for counters grouped by transaction mode and outcome.
+    /// Can only be updated at tx close, as outcome is only known at that point.
+    transaction_outcomes: FxHashMap<(TransactionMode, TransactionOutcome), TransactionMetrics>,
 }
 
 impl DatabaseEnvMetrics {
     pub(crate) fn new() -> Self {
-        // Pre-populate the map with all possible table and operation combinations
+        // Pre-populate metric handle maps with all possible combinations of labels
         // to avoid runtime locks on the map when recording metrics.
-        let mut operations = HashMap::with_capacity_and_hasher(
+        Self {
+            operations: Self::generate_operation_handles(),
+            open_transactions: Self::generate_transaction_mode_handles(),
+            transaction_outcomes: Self::generate_transaction_mode_and_outcome_handles(),
+        }
+    }
+
+    /// Generate a map of all possible operation handles for each table and operation tuple.
+    /// Used for tracking all operation metrics.
+    fn generate_operation_handles() -> FxHashMap<(Tables, Operation), OperationMetrics> {
+        let mut operations = FxHashMap::with_capacity_and_hasher(
             Tables::COUNT * Operation::COUNT,
             BuildHasherDefault::<FxHasher>::default(),
         );
@@ -39,7 +55,48 @@ impl DatabaseEnvMetrics {
                 );
             }
         }
-        Self { operations }
+        operations
+    }
+
+    /// Generate a map of all possible transaction mode handles.
+    /// Used for tracking a counter of open transactions.
+    fn generate_transaction_mode_handles() -> FxHashMap<TransactionMode, TransactionMetrics> {
+        let mut open_transactions = HashMap::with_capacity_and_hasher(
+            TransactionMode::COUNT,
+            BuildHasherDefault::<FxHasher>::default(),
+        );
+        for mode in TransactionMode::iter() {
+            open_transactions.insert(
+                mode,
+                TransactionMetrics::new_with_labels(&[(
+                    Labels::TransactionMode.as_str(),
+                    mode.as_str(),
+                )]),
+            );
+        }
+        open_transactions
+    }
+
+    /// Generate a map of all possible transaction mode and outcome handles.
+    /// Used for tracking various stats for finished transactions (e.g. commit duration).
+    fn generate_transaction_mode_and_outcome_handles(
+    ) -> FxHashMap<(TransactionMode, TransactionOutcome), TransactionMetrics> {
+        let mut transaction_outcomes = HashMap::with_capacity_and_hasher(
+            TransactionMode::COUNT * TransactionOutcome::COUNT,
+            BuildHasherDefault::<FxHasher>::default(),
+        );
+        for mode in TransactionMode::iter() {
+            for outcome in TransactionOutcome::iter() {
+                transaction_outcomes.insert(
+                    (mode, outcome),
+                    TransactionMetrics::new_with_labels(&[
+                        (Labels::TransactionMode.as_str(), mode.as_str()),
+                        (Labels::TransactionOutcome.as_str(), outcome.as_str()),
+                    ]),
+                );
+            }
+        }
+        transaction_outcomes
     }
 
     /// Record a metric for database operation executed in `f`.
@@ -56,10 +113,38 @@ impl DatabaseEnvMetrics {
             .expect("operation & table metric handle not found")
             .record(value_size, f)
     }
+
+    /// Record metrics for opening a database transaction.
+    pub(crate) fn record_opened_transaction(&self, mode: TransactionMode) {
+        self.open_transactions
+            .get(&mode)
+            .expect("transaction mode metric handle not found")
+            .record_open();
+    }
+
+    /// Record metrics for closing a database transactions.
+    pub(crate) fn record_closed_transaction(
+        &self,
+        mode: TransactionMode,
+        outcome: TransactionOutcome,
+        open_duration: Duration,
+        close_duration: Option<Duration>,
+        commit_latency: Option<CommitLatency>,
+    ) {
+        self.open_transactions
+            .get(&mode)
+            .expect("transaction mode metric handle not found")
+            .record_close();
+
+        self.transaction_outcomes
+            .get(&(mode, outcome))
+            .expect("transaction outcome metric handle not found")
+            .record_durations(open_duration, close_duration, commit_latency);
+    }
 }
 
 /// Transaction mode for the database, either read-only or read-write.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, EnumCount, EnumIter)]
 pub(crate) enum TransactionMode {
     /// Read-only transaction mode.
     ReadOnly,
@@ -82,7 +167,7 @@ impl TransactionMode {
 }
 
 /// Transaction outcome after a database operation - commit, abort, or drop.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, EnumCount, EnumIter)]
 pub(crate) enum TransactionOutcome {
     /// Successful commit of the transaction.
     Commit,
@@ -197,42 +282,38 @@ pub(crate) struct TransactionMetrics {
 
 impl TransactionMetrics {
     /// Record transaction opening.
-    pub(crate) fn record_open(mode: TransactionMode) {
-        let metrics = Self::new_with_labels(&[(Labels::TransactionMode.as_str(), mode.as_str())]);
-        metrics.open_total.increment(1.0);
+    pub(crate) fn record_open(&self) {
+        self.open_total.increment(1.0);
     }
 
-    /// Record transaction closing with the duration it was open and the duration it took to close
-    /// it.
-    pub(crate) fn record_close(
-        mode: TransactionMode,
-        outcome: TransactionOutcome,
+    /// Record transaction closing.
+    pub(crate) fn record_close(&self) {
+        self.open_total.decrement(1.0);
+    }
+
+    /// Records the duration of a transaction and the time it took to close it. Should be
+    /// called when a transaction is closed.
+    pub(crate) fn record_durations(
+        &self,
         open_duration: Duration,
         close_duration: Option<Duration>,
         commit_latency: Option<CommitLatency>,
     ) {
-        let metrics = Self::new_with_labels(&[(Labels::TransactionMode.as_str(), mode.as_str())]);
-        metrics.open_total.decrement(1.0);
-
-        let metrics = Self::new_with_labels(&[
-            (Labels::TransactionMode.as_str(), mode.as_str()),
-            (Labels::TransactionOutcome.as_str(), outcome.as_str()),
-        ]);
-        metrics.open_duration_seconds.record(open_duration);
+        self.open_duration_seconds.record(open_duration);
 
         if let Some(close_duration) = close_duration {
-            metrics.close_duration_seconds.record(close_duration)
+            self.close_duration_seconds.record(close_duration)
         }
 
         if let Some(commit_latency) = commit_latency {
-            metrics.commit_preparation_duration_seconds.record(commit_latency.preparation());
-            metrics.commit_gc_wallclock_duration_seconds.record(commit_latency.gc_wallclock());
-            metrics.commit_audit_duration_seconds.record(commit_latency.audit());
-            metrics.commit_write_duration_seconds.record(commit_latency.write());
-            metrics.commit_sync_duration_seconds.record(commit_latency.sync());
-            metrics.commit_ending_duration_seconds.record(commit_latency.ending());
-            metrics.commit_whole_duration_seconds.record(commit_latency.whole());
-            metrics.commit_gc_cputime_duration_seconds.record(commit_latency.gc_cputime());
+            self.commit_preparation_duration_seconds.record(commit_latency.preparation());
+            self.commit_gc_wallclock_duration_seconds.record(commit_latency.gc_wallclock());
+            self.commit_audit_duration_seconds.record(commit_latency.audit());
+            self.commit_write_duration_seconds.record(commit_latency.write());
+            self.commit_sync_duration_seconds.record(commit_latency.sync());
+            self.commit_ending_duration_seconds.record(commit_latency.ending());
+            self.commit_whole_duration_seconds.record(commit_latency.whole());
+            self.commit_gc_cputime_duration_seconds.record(commit_latency.gc_cputime());
         }
     }
 }
