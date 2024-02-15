@@ -61,20 +61,17 @@ impl DatabaseEnvMetrics {
     /// Generate a map of all possible transaction mode handles.
     /// Used for tracking a counter of open transactions.
     fn generate_transaction_mode_handles() -> FxHashMap<TransactionMode, TransactionMetrics> {
-        let mut open_transactions = HashMap::with_capacity_and_hasher(
-            TransactionMode::COUNT,
-            BuildHasherDefault::<FxHasher>::default(),
-        );
-        for mode in TransactionMode::iter() {
-            open_transactions.insert(
-                mode,
-                TransactionMetrics::new_with_labels(&[(
-                    Labels::TransactionMode.as_str(),
-                    mode.as_str(),
-                )]),
-            );
-        }
-        open_transactions
+        TransactionMode::iter()
+            .map(|mode| {
+                (
+                    mode,
+                    TransactionMetrics::new_with_labels(&[(
+                        Labels::TransactionMode.as_str(),
+                        mode.as_str(),
+                    )]),
+                )
+            })
+            .collect()
     }
 
     /// Generate a map of all possible transaction mode and outcome handles.
